@@ -1,0 +1,25 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env_isaaclab/
+
+# Local development files
+.cursorignore
+
+# Package files
+IsaacGym_Preview_4_Package.tar.gz
+isaacgym/
+
+# Logs
+logs/
+
+# Resources
+resources/t1.usd
+
+# Editor/IDE specific files
+.vscode/
+.idea/ 
