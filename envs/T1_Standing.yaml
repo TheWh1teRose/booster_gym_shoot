@@ -5,11 +5,12 @@ basic:
   sim_device: "cuda:0" # device for physics simulation
   rl_device: "cuda:0" # device for the RL algorithm
   seed: 42 # seed - set to -1 to choose random seed
+  task: "T1_Standing"
   description: ""
 
 env:
   num_envs: 4096
-  num_observations: 47
+  num_observations: 44
   num_privileged_obs: 14
   num_actions: 12
   env_spacing: 1.  # not used with plane terrain
@@ -22,7 +23,7 @@ runner:
 
 viewer:
   pos: [3., -3., 2.]  # [m]
-  lookat: [0., 0., 0.]  # [m]
+  lookat: [15., 0., 0.]  # [m]
   record_video: true  # only in play
   record_interval: 5.  # [s]
   record_env_idx: 0
@@ -113,7 +114,7 @@ terrain:
   slope_threshold: 2.0
 
 commands:
-  num_commands: 3 # default: lin_vel_x, lin_vel_y, ang_vel_yaw
+  num_commands: 0 # default: lin_vel_x, lin_vel_y, ang_vel_yaw
   stillphysics_proportion: 0.1
   lin_vel_x: [-1.0, 1.0] # min max [m/s]
   lin_vel_y: [-1.0, 1.0] # min max [m/s]
@@ -251,9 +252,9 @@ randomization:
 rewards:
   scales:
     survival: 0.25
-    tracking_lin_vel_x: 1.0
-    tracking_lin_vel_y: 1.0
-    tracking_ang_vel: 0.5
+    tracking_lin_vel_x: 0.5
+    tracking_lin_vel_y: 0.5
+    tracking_ang_vel: 0.2
     base_height: -20.
     orientation: -5.
     torques: -2.e-4
@@ -274,8 +275,8 @@ rewards:
     feet_yaw_diff: -1.
     feet_yaw_mean: -1.
     feet_roll: -0.1
-    feet_distance: -1.
-    feet_swing: 3.
+    feet_distance: -5.
+    body_angle: 1.
   episode_length_s: 30.
   terminate_height: 0.45
   terminate_vel: 50.

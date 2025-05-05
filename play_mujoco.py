@@ -80,6 +80,9 @@ if __name__ == "__main__":
         viewer.cam.elevation = -20
         print(f"Set command (x, y, yaw): ")
         while viewer.is_running():
+            lin_vel_x = 0
+            lin_vel_y = 0
+            ang_vel_yaw = 0
             if select.select([sys.stdin], [], [], 0)[0]:
                 try:
                     parts = sys.stdin.readline().strip().split()
@@ -106,14 +109,11 @@ if __name__ == "__main__":
                 obs = np.zeros(cfg["env"]["num_observations"], dtype=np.float32)
                 obs[0:3] = projected_gravity * cfg["normalization"]["gravity"]
                 obs[3:6] = base_ang_vel * cfg["normalization"]["ang_vel"]
-                obs[6] = lin_vel_x * cfg["normalization"]["lin_vel"]
-                obs[7] = lin_vel_y * cfg["normalization"]["lin_vel"]
-                obs[8] = ang_vel_yaw * cfg["normalization"]["ang_vel"]
-                obs[9] = np.cos(2 * np.pi * gait_process) * (gait_frequency > 1.0e-8)
-                obs[10] = np.sin(2 * np.pi * gait_process) * (gait_frequency > 1.0e-8)
-                obs[11:23] = (dof_pos - default_dof_pos) * cfg["normalization"]["dof_pos"]
-                obs[23:35] = dof_vel * cfg["normalization"]["dof_vel"]
-                obs[35:47] = actions
+                obs[6] = np.cos(2 * np.pi * gait_process) * (gait_frequency > 1.0e-8)
+                obs[7] = np.sin(2 * np.pi * gait_process) * (gait_frequency > 1.0e-8)
+                obs[8:20] = (dof_pos - default_dof_pos) * cfg["normalization"]["dof_pos"]
+                obs[20:32] = dof_vel * cfg["normalization"]["dof_vel"]
+                obs[32:44] = actions
                 dist = model.act(torch.tensor(obs).unsqueeze(0))
                 actions[:] = dist.loc.detach().numpy()
                 actions[:] = np.clip(actions, -cfg["normalization"]["clip_actions"], cfg["normalization"]["clip_actions"])
