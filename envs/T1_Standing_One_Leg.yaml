@@ -5,12 +5,12 @@ basic:
   sim_device: "cuda:0" # device for physics simulation
   rl_device: "cuda:0" # device for the RL algorithm
   seed: 42 # seed - set to -1 to choose random seed
-  task: "T1_Standing"
+  task: "T1_Standing_One_Leg"
   description: ""
 
 env:
   num_envs: 4096
-  num_observations: 44
+  num_observations: 42
   num_privileged_obs: 14
   num_actions: 12
   env_spacing: 1.  # not used with plane terrain
@@ -96,7 +96,7 @@ control:
   decimation: 10
 
 terrain:
-  type: "trimesh" # "plane" or "trimesh"
+  type: "plane" # "plane" or "trimesh"
   static_friction: 1.0  # [-]
   dynamic_friction: 1.0  # [-]
   restitution: 0.        # [-]
@@ -187,22 +187,22 @@ randomization:
 
   kick_interval_s: 2.
   kick_lin_vel:
-    range: [0., 0.1]
+    range: [0., 0.]
     operation: "additive"
     distribution: "gaussian"
   kick_ang_vel:
-    range: [0., 0.02]
+    range: [0., 0.0]
     operation: "additive"
     distribution: "gaussian"
 
   push_interval_s: 5.
   push_duration_s: 1.
   push_force:
-    range: [0., 10.]
+    range: [0., 0.]
     operation: "additive"
     distribution: "gaussian"
   push_torque:
-    range: [0., 2.]
+    range: [0., 0.]
     operation: "additive"
     distribution: "gaussian"
 
@@ -251,12 +251,12 @@ randomization:
 
 rewards:
   scales:
-    survival: 0.50
-    tracking_lin_vel_x: 0.5
-    tracking_lin_vel_y: 0.5
+    survival: 0.25
+    tracking_lin_vel_x: 0.3
+    tracking_lin_vel_y: 0.3
     tracking_ang_vel: 0.2
     base_height: -20.
-    orientation: -5.
+    orientation: -0.
     torques: -2.e-4
     torque_tiredness: -1.e-2
     power: -2.e-3
@@ -274,9 +274,11 @@ rewards:
     feet_vel_z: -0.
     feet_yaw_diff: -1.
     feet_yaw_mean: -1.
-    feet_roll: -0.1
-    feet_distance: -5.
-    body_angle: 1.
+    feet_roll: -0.5
+    left_feet_x: 0.1
+    left_feet_y: 0.1
+    left_feet_z: 3
+    left_feet_touching_ground: -1.
   episode_length_s: 30.
   terminate_height: 0.45
   terminate_vel: 50.
@@ -289,4 +291,7 @@ rewards:
   soft_dof_vel_limit: 1.
   soft_torque_limit: 1.
   swing_period: 0.2
-  feet_distance_ref: 0.2
+  feet_distance_ref_x: 0.22
+  feet_distance_ref_y: 0
+  feet_distance_ref_z: 0.25
+  left_feet_on_ground_length_s: 2

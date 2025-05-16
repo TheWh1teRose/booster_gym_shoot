@@ -79,6 +79,7 @@ if __name__ == "__main__":
     with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
         viewer.cam.elevation = -20
         print(f"Set command (x, y, yaw): ")
+        push_applied = False  # Flag to track if push has been applied
         while viewer.is_running():
             lin_vel_x = 0
             lin_vel_y = 0
@@ -92,6 +93,16 @@ if __name__ == "__main__":
                             gait_frequency = 0
                         else:
                             gait_frequency = np.average(cfg["commands"]["gait_frequency"])
+                            # Apply push by setting velocity directly
+                            if not push_applied:
+                                # Get current orientation
+                                quat = mj_data.sensor("orientation").data[[1, 2, 3, 0]]
+                                # Convert commanded velocities to world frame
+                                push_vel = np.array([lin_vel_x, lin_vel_y, 0])
+                                world_push_vel = quat_rotate_inverse(quat, push_vel)
+                                # Apply the push velocity
+                                mj_data.qvel[0:3] = world_push_vel / 3  # Scale factor of 2.0 for the push
+                                push_applied = True
                         print(
                             f"Updated command to: x={lin_vel_x}, y={lin_vel_y}, yaw={ang_vel_yaw}\nSet command (x, y, yaw): ",
                             end="",
@@ -100,6 +111,11 @@ if __name__ == "__main__":
                         raise ValueError
                 except ValueError:
                     print("Invalid input. Enter three numeric values.\nSet command (x, y, yaw): ", end="")
+            
+            # Reset the push flag after one timestep
+            if push_applied:
+                push_applied = False
+
             dof_pos = mj_data.qpos.astype(np.float32)[7:]
             dof_vel = mj_data.qvel.astype(np.float32)[6:]
             quat = mj_data.sensor("orientation").data[[1, 2, 3, 0]].astype(np.float32)
@@ -109,11 +125,9 @@ if __name__ == "__main__":
                 obs = np.zeros(cfg["env"]["num_observations"], dtype=np.float32)
                 obs[0:3] = projected_gravity * cfg["normalization"]["gravity"]
                 obs[3:6] = base_ang_vel * cfg["normalization"]["ang_vel"]
-                obs[6] = np.cos(2 * np.pi * gait_process) * (gait_frequency > 1.0e-8)
-                obs[7] = np.sin(2 * np.pi * gait_process) * (gait_frequency > 1.0e-8)
-                obs[8:20] = (dof_pos - default_dof_pos) * cfg["normalization"]["dof_pos"]
-                obs[20:32] = dof_vel * cfg["normalization"]["dof_vel"]
-                obs[32:44] = actions
+                obs[6:18] = (dof_pos - default_dof_pos) * cfg["normalization"]["dof_pos"]
+                obs[18:30] = dof_vel * cfg["normalization"]["dof_vel"]
+                obs[30:42] = actions
                 dist = model.act(torch.tensor(obs).unsqueeze(0))
                 actions[:] = dist.loc.detach().numpy()
                 actions[:] = np.clip(actions, -cfg["normalization"]["clip_actions"], cfg["normalization"]["clip_actions"])
