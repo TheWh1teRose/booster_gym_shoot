@@ -21,7 +21,7 @@ from .base_task import BaseTask
 from utils.utils import apply_randomization
 
 
-class T1_Standing(BaseTask):
+class T1_Shooting(BaseTask):
 
     def __init__(self, cfg):
         super().__init__(cfg)
@@ -36,6 +36,7 @@ class T1_Standing(BaseTask):
         asset_root = os.path.dirname(asset_cfg["file"])
         asset_file = os.path.basename(asset_cfg["file"])
 
+        # Load robot asset
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = asset_cfg["default_dof_drive_mode"]
         asset_options.collapse_fixed_joints = asset_cfg["collapse_fixed_joints"]
@@ -52,6 +53,33 @@ class T1_Standing(BaseTask):
         asset_options.disable_gravity = asset_cfg["disable_gravity"]
 
         robot_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+        self.robot_body_names = self.gym.get_asset_rigid_body_names(robot_asset)
+
+        # Load ball asset
+        ball_cfg = self.cfg["ball"]
+        ball_root = os.path.dirname(ball_cfg["file"])
+        ball_file = os.path.basename(ball_cfg["file"])
+        
+        ball_asset_options = gymapi.AssetOptions()
+        ball_asset_options.density = ball_cfg["density"]
+        ball_asset_options.angular_damping = 0.0
+        ball_asset_options.linear_damping = 0.0
+        ball_asset_options.max_angular_velocity = 1000.0
+        ball_asset_options.max_linear_velocity = 1000.0
+        ball_asset_options.disable_gravity = False
+        ball_asset_options.replace_cylinder_with_capsule = False
+        ball_asset_options.thickness = ball_cfg["thickness"]
+        
+        ball_asset = self.gym.load_asset(self.sim, ball_root, ball_file, ball_asset_options)
+
+        # Store ball properties
+        self.ball_radius = 0.05  # From URDF
+        self.ball_init_pos = to_torch(ball_cfg["init_pos"], device=self.device)
+        self.ball_init_rot = to_torch(ball_cfg["init_rot"], device=self.device)
+        self.ball_init_lin_vel = to_torch(ball_cfg["init_lin_vel"], device=self.device)
+        self.ball_init_ang_vel = to_torch(ball_cfg["init_ang_vel"], device=self.device)
+
+        # Continue with robot setup...
         self.num_dofs = self.gym.get_asset_dof_count(robot_asset)
         self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
@@ -115,17 +143,20 @@ class T1_Standing(BaseTask):
         start_pose.p = gymapi.Vec3(*self.base_init_state[:3])
 
         self._get_env_origins()
-        env_lower = gymapi.Vec3(0.0, 0.0, 0.0)
-        env_upper = gymapi.Vec3(0.0, 0.0, 0.0)
+        env_lower = gymapi.Vec3(-5, 0.0, -5)
+        env_upper = gymapi.Vec3(5, 5, 5)
         self.envs = []
         self.actor_handles = []
+        self.ball_handles = []  # Store ball handles
         self.base_mass_scaled = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device)
+        
         for i in range(self.num_envs):
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
-            pos = self.env_origins[i].clone()
-            start_pose.p = gymapi.Vec3(*pos)
+            #pos = self.env_origins[i].clone()
+            #start_pose.p = gymapi.Vec3(*pos)
 
-            actor_handle = self.gym.create_actor(env_handle, robot_asset, start_pose, asset_cfg["name"], i, asset_cfg["self_collisions"], 0)
+            # Create robot actor
+            actor_handle = self.gym.create_actor(env_handle, robot_asset, start_pose, asset_cfg["name"], i)
             body_props = self.gym.get_actor_rigid_body_properties(env_handle, actor_handle)
             body_props = self._process_rigid_body_props(body_props, i)
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
@@ -133,8 +164,35 @@ class T1_Standing(BaseTask):
             shape_props = self._process_rigid_shape_props(shape_props)
             self.gym.set_actor_rigid_shape_properties(env_handle, actor_handle, shape_props)
             self.gym.enable_actor_dof_force_sensors(env_handle, actor_handle)
+
+            # Create ball actor
+            ball_pose = gymapi.Transform()
+            ball_pose.p = gymapi.Vec3(*self.env_origins[i])
+            ball_pose.p += gymapi.Vec3(self.ball_init_pos[0], self.ball_init_pos[1], self.ball_init_pos[2])
+            ball_pose.r = gymapi.Quat(self.ball_init_rot[0], self.ball_init_rot[1], self.ball_init_rot[2], self.ball_init_rot[3])
+
+            ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_pose, ball_cfg["name"], i)
+
+            ball_body_props = self.gym.get_actor_rigid_body_properties(env_handle, ball_handle)
+            
+            # Set ball properties
+            ball_shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, ball_handle)
+            ball_shape_props[0].restitution = ball_cfg["restitution"]
+            ball_shape_props[0].friction = ball_cfg["friction"]
+            ball_shape_props[0].rolling_friction = ball_cfg["rolling_friction"]
+            #ball_shape_props[0].contact_offset = ball_cfg["contact_offset"]
+            self.gym.set_actor_rigid_shape_properties(env_handle, ball_handle, ball_shape_props)
+
+            # Store handles
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
+            self.ball_handles.append(ball_handle)
+
+        # Initialize ball state tensors
+        self.ball_pos = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
+        self.ball_rot = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device)
+        self.ball_lin_vel = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
+        self.ball_ang_vel = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
 
     def _process_rigid_body_props(self, props, i):
         for j in range(self.num_bodies):
@@ -168,21 +226,7 @@ class T1_Standing(BaseTask):
 
     def _get_env_origins(self):
         self.env_origins = torch.zeros(self.num_envs, 3, device=self.device)
-        if self.cfg["terrain"]["type"] == "plane":
-            num_cols = np.floor(np.sqrt(self.num_envs))
-            num_rows = np.ceil(self.num_envs / num_cols)
-            xx, yy = torch.meshgrid(torch.arange(num_rows), torch.arange(num_cols), indexing="ij")
-            spacing = self.cfg["env"]["env_spacing"]
-            self.env_origins[:, 0] = spacing * xx.flatten()[: self.num_envs]
-            self.env_origins[:, 1] = spacing * yy.flatten()[: self.num_envs]
-            self.env_origins[:, 2] = 0.0
-        else:
-            num_cols = max(1.0, np.floor(np.sqrt(self.num_envs * self.terrain.env_length / self.terrain.env_width)))
-            num_rows = np.ceil(self.num_envs / num_cols)
-            xx, yy = torch.meshgrid(torch.arange(num_rows), torch.arange(num_cols), indexing="ij")
-            self.env_origins[:, 0] = self.terrain.env_width / (num_rows + 1) * (xx.flatten()[: self.num_envs] + 1)
-            self.env_origins[:, 1] = self.terrain.env_length / (num_cols + 1) * (yy.flatten()[: self.num_envs] + 1)
-            self.env_origins[:, 2] = self.terrain.terrain_heights(self.env_origins)
+        
 
     def _init_buffers(self):
         self.num_obs = self.cfg["env"]["num_observations"]
@@ -195,6 +239,7 @@ class T1_Standing(BaseTask):
         self.rew_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.reset_buf = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.min_ball_vel_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         self.time_out_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.extras = {}
         self.extras["rew_terms"] = {}
@@ -212,14 +257,21 @@ class T1_Standing(BaseTask):
         self.gym.refresh_rigid_body_state_tensor(self.sim)
 
         # create some wrapper tensors for different slices
-        self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        root_states = gymtorch.wrap_tensor(actor_root_state)
+        # Reshape root states to separate robot and ball states
+        self.root_states = root_states.view(self.num_envs, 2, 13)
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 1]
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)  # shape: num_envs, num_bodies, xyz axis
-        self.body_states = gymtorch.wrap_tensor(body_state).view(self.num_envs, self.num_bodies, 13)
-        self.base_pos = self.root_states[:, 0:3]
-        self.base_quat = self.root_states[:, 3:7]
+        self.body_states = gymtorch.wrap_tensor(body_state).view(self.num_envs, self.num_bodies, 14)
+        # Get robot states (index 0) and ball states (index 1)
+        self.base_pos = self.root_states[:, 0, 0:3]  # Robot position
+        self.base_quat = self.root_states[:, 0, 3:7]  # Robot quaternion
+        self.ball_pos = self.root_states[:, 1, 0:3]  # Ball position
+        self.ball_rot = self.root_states[:, 1, 3:7]  # Ball quaternion
+        self.ball_lin_vel = self.root_states[:, 1, 7:10]  # Ball linear velocity
+        self.ball_ang_vel = self.root_states[:, 1, 10:13]  # Ball angular velocity
         self.feet_pos = self.body_states[:, self.feet_indices, 0:3]
         self.feet_quat = self.body_states[:, self.feet_indices, 3:7]
 
@@ -229,7 +281,7 @@ class T1_Standing(BaseTask):
         self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device)
         self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device)
         self.last_dof_vel = torch.zeros_like(self.dof_vel)
-        self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
+        self.last_root_vel = torch.zeros_like(self.root_states[:, 0, 7:13])
         self.last_dof_targets = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
         self.delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.torques = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
@@ -237,8 +289,9 @@ class T1_Standing(BaseTask):
         self.cmd_resample_time = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.gait_frequency = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.gait_process = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-        self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
-        self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 0, 7:10])
+        self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 0, 10:13])
+        # Only apply gravity to robot's state
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
         self.filtered_lin_vel = self.base_lin_vel.clone()
         self.filtered_ang_vel = self.base_ang_vel.clone()
@@ -302,13 +355,15 @@ class T1_Standing(BaseTask):
         if len(env_ids) == 0:
             return
 
-        #self._update_curriculum(env_ids)
+        # Reset robot
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
 
+        # Continue with existing reset code...
         self.last_dof_targets[env_ids] = self.dof_pos[env_ids]
-        self.last_root_vel[env_ids] = self.root_states[env_ids, 7:13]
+        self.last_root_vel[env_ids] = self.root_states[env_ids, 0, 7:13]
         self.episode_length_buf[env_ids] = 0
+        self.min_ball_vel_buf[env_ids] = 0.0
         self.filtered_lin_vel[env_ids] = 0.0
         self.filtered_ang_vel[env_ids] = 0.0
         self.cmd_resample_time[env_ids] = 0
@@ -319,42 +374,71 @@ class T1_Standing(BaseTask):
     def _reset_dofs(self, env_ids):
         self.dof_pos[env_ids] = apply_randomization(self.default_dof_pos, self.cfg["randomization"].get("init_dof_pos"))
         self.dof_vel[env_ids] = 0.0
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        # Multiply by 2 because there are 2 actors per environment (robot and ball)
+        # This ensures we only update the robot actor's DOFs
+        env_ids_int32 = (2 * env_ids).to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(
             self.sim, gymtorch.unwrap_tensor(self.dof_state), gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32)
         )
 
     def _reset_root_states(self, env_ids):
-        self.root_states[env_ids] = self.base_init_state
-        self.root_states[env_ids, :2] += self.env_origins[env_ids, :2]
-        self.root_states[env_ids, :2] = apply_randomization(self.root_states[env_ids, :2], self.cfg["randomization"].get("init_base_pos_xy"))
-        self.root_states[env_ids, 2] += self.terrain.terrain_heights(self.root_states[env_ids, :2])
-        self.root_states[env_ids, 3:7] = quat_from_euler_xyz(
-            torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
-            torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
-            torch.rand(len(env_ids), device=self.device) * (2 * torch.pi),
+        # Initialize robot states (index 0)
+        self.root_states[env_ids, 0, :] = self.base_init_state
+        self.root_states[env_ids, 0, :2] += self.env_origins[env_ids, :2]
+        #self.root_states[env_ids, 0, :2] = apply_randomization(self.root_states[env_ids, 0, :2], self.cfg["randomization"].get("init_base_pos_xy"))
+        #self.root_states[env_ids, 0, 2] += self.terrain.terrain_heights(self.root_states[env_ids, 0, :2])
+        #self.root_states[env_ids, 0, 3:7] = quat_from_euler_xyz(
+        #    torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
+        #    torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
+        #    torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
+        #    #torch.rand(len(env_ids), device=self.device) * (2 * torch.pi),
+        #)
+        #self.root_states[env_ids, 0, 7:9] = apply_randomization(
+        #    torch.zeros(len(env_ids), 2, dtype=torch.float, device=self.device),
+        #    self.cfg["randomization"].get("init_base_lin_vel_xy"),
+        #)
+
+        # Initialize ball states (index 1)
+        self.root_states[env_ids, 1, 0:3] = self.env_origins[env_ids, :3] + torch.tensor(self.ball_init_pos, device=self.device)
+        self.root_states[env_ids, 1, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
+        self.root_states[env_ids, 1, 7:10] = torch.zeros(3, dtype=torch.float, device=self.device)
+        self.root_states[env_ids, 1, 10:13] = torch.zeros(3, dtype=torch.float, device=self.device)
+
+        # Update the simulation with new state tensor
+        # The self.root_states tensor has been updated with the desired reset states for the specified env_ids.
+        # Now, we create a list of actor indices that correspond to these updated states.
+        robot_actor_indices = 2 * env_ids
+        ball_actor_indices = 2 * env_ids + 1
+        
+        # Interleave indices: [robot_env0, ball_env0, robot_env1, ball_env1, ...]
+        # Converts to a flat tensor of shape (2 * len(env_ids),) with dtype int32
+        actor_indices_to_update = torch.stack((robot_actor_indices, ball_actor_indices), dim=-1).view(-1).to(dtype=torch.int32)
+        num_indices = actor_indices_to_update.shape[0]
+
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_states),  # Full root states buffer
+            gymtorch.unwrap_tensor(actor_indices_to_update),  # Indices of actors to update
+            num_indices  # Number of actor indices
         )
-        self.root_states[env_ids, 7:9] = apply_randomization(
-            torch.zeros(len(env_ids), 2, dtype=torch.float, device=self.device),
-            self.cfg["randomization"].get("init_base_lin_vel_xy"),
-        )
-        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
     def _teleport_robot(self):
         if self.terrain.type == "plane":
             return
-        out_x_min = self.root_states[:, 0] < -0.75 * self.terrain.border_size
-        out_x_max = self.root_states[:, 0] > self.terrain.env_width + 0.75 * self.terrain.border_size
-        out_y_min = self.root_states[:, 1] < -0.75 * self.terrain.border_size
-        out_y_max = self.root_states[:, 1] > self.terrain.env_length + 0.75 * self.terrain.border_size
-        self.root_states[out_x_min, 0] += self.terrain.env_width + self.terrain.border_size
-        self.root_states[out_x_max, 0] -= self.terrain.env_width + self.terrain.border_size
-        self.root_states[out_y_min, 1] += self.terrain.env_length + self.terrain.border_size
-        self.root_states[out_y_max, 1] -= self.terrain.env_length + self.terrain.border_size
+        out_x_min = self.root_states[:, 0, 0] < -0.75 * self.terrain.border_size
+        out_x_max = self.root_states[:, 0, 0] > self.terrain.env_width + 0.75 * self.terrain.border_size
+        out_y_min = self.root_states[:, 0, 1] < -0.75 * self.terrain.border_size
+        out_y_max = self.root_states[:, 0, 1] > self.terrain.env_length + 0.75 * self.terrain.border_size
+
+        self.root_states[out_x_min, 0, 0] += self.terrain.env_width + self.terrain.border_size
+        self.root_states[out_x_max, 0, 0] -= self.terrain.env_width + self.terrain.border_size
+        self.root_states[out_y_min, 0, 1] += self.terrain.env_length + self.terrain.border_size
+        self.root_states[out_y_max, 0, 1] -= self.terrain.env_length + self.terrain.border_size
         self.body_states[out_x_min, :, 0] += self.terrain.env_width + self.terrain.border_size
         self.body_states[out_x_max, :, 0] -= self.terrain.env_width + self.terrain.border_size
         self.body_states[out_y_min, :, 1] += self.terrain.env_length + self.terrain.border_size
         self.body_states[out_y_max, :, 1] -= self.terrain.env_length + self.terrain.border_size
+
         if out_x_min.any() or out_x_max.any() or out_y_min.any() or out_y_max.any():
             self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
             self._refresh_feet_state()
@@ -438,7 +522,6 @@ class T1_Standing(BaseTask):
         # pre physics step
         self.actions[:] = torch.clip(actions, -self.cfg["normalization"]["clip_actions"], self.cfg["normalization"]["clip_actions"])
         dof_targets = self.default_dof_pos + self.cfg["control"]["action_scale"] * self.actions
-        print(dof_targets)
 
         # perform physics step
         self.torques.zero_()
@@ -461,10 +544,16 @@ class T1_Standing(BaseTask):
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
-        self.base_pos[:] = self.root_states[:, 0:3]
-        self.base_quat[:] = self.root_states[:, 3:7]
-        self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
-        self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        
+        self.ball_pos[:] = self.root_states[:, 1, 0:3]
+        ball_quat = self.root_states[:, 1, 3:7]
+        self.ball_lin_vel[:] = quat_rotate_inverse(ball_quat, self.root_states[:, 1, 7:10])
+        self.ball_ang_vel[:] = quat_rotate_inverse(ball_quat, self.root_states[:, 1, 10:13])
+
+        self.base_pos[:] = self.root_states[:, 0, 0:3]
+        self.base_quat[:] = self.root_states[:, 0, 3:7]
+        self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 0, 7:10])
+        self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 0, 10:13])
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
         self.filtered_lin_vel[:] = self.base_lin_vel[:] * self.cfg["normalization"]["filter_weight"] + self.filtered_lin_vel[:] * (
             1.0 - self.cfg["normalization"]["filter_weight"]
@@ -475,24 +564,28 @@ class T1_Standing(BaseTask):
         self._refresh_feet_state()
 
         self.episode_length_buf += 1
+        self.min_ball_vel_buf = torch.where(
+            self.ball_lin_vel[:, 0] > 0.1,
+            self.min_ball_vel_buf + 1.0,
+            torch.zeros_like(self.min_ball_vel_buf)
+        )
         self.common_step_counter += 1
         self.gait_process[:] = torch.fmod(self.gait_process + self.dt * self.gait_frequency, 1.0)
 
-        self._kick_robots()
-        self._push_robots()
+        #self._kick_robots()
+        #self._push_robots()
         self._check_termination()
         self._compute_reward()
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self._reset_idx(env_ids)
-        self._teleport_robot()
-        #self._resample_commands()
+        #self._teleport_robot()
 
         self._compute_observations()
 
         self.last_actions[:] = self.actions
         self.last_dof_vel[:] = self.dof_vel
-        self.last_root_vel[:] = self.root_states[:, 7:13]
+        self.last_root_vel[:] = self.root_states[:, 0, 7:13]
         self.last_feet_pos[:] = self.feet_pos
 
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
@@ -500,8 +593,8 @@ class T1_Standing(BaseTask):
     def _kick_robots(self):
         """Random kick the robots. Emulates an impulse by setting a randomized base velocity."""
         if self.common_step_counter % np.ceil(self.cfg["randomization"]["kick_interval_s"] / self.dt) == 0:
-            self.root_states[:, 7:10] = apply_randomization(self.root_states[:, 7:10], self.cfg["randomization"].get("kick_lin_vel"))
-            self.root_states[:, 10:13] = apply_randomization(self.root_states[:, 10:13], self.cfg["randomization"].get("kick_ang_vel"))
+            self.root_states[:, 0, 7:10] = apply_randomization(self.root_states[:, 0, 7:10], self.cfg["randomization"].get("kick_lin_vel"))
+            self.root_states[:, 0, 10:13] = apply_randomization(self.root_states[:, 0, 10:13], self.cfg["randomization"].get("kick_ang_vel"))
             self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
     def _push_robots(self):
@@ -552,10 +645,11 @@ class T1_Standing(BaseTask):
     def _check_termination(self):
         """Check if environments need to be reset"""
         self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.0, dim=1)
-        self.reset_buf |= self.root_states[:, 7:13].square().sum(dim=-1) > self.cfg["rewards"]["terminate_vel"]
+        self.reset_buf |= self.root_states[:, 0, 7:13].square().sum(dim=-1) > self.cfg["rewards"]["terminate_vel"]
         self.reset_buf |= self.base_pos[:, 2] - self.terrain.terrain_heights(self.base_pos) < self.cfg["rewards"]["terminate_height"]
         self.time_out_buf = self.episode_length_buf > np.ceil(self.cfg["rewards"]["episode_length_s"] / self.dt)
         self.reset_buf |= self.time_out_buf
+        self.reset_buf |= self.min_ball_vel_buf > np.ceil(self.cfg["rewards"]["min_ball_vel_s"] / self.dt)
         self.time_out_buf |= self.episode_length_buf == self.cmd_resample_time
 
     def _compute_reward(self):
@@ -582,9 +676,11 @@ class T1_Standing(BaseTask):
             (
                 apply_randomization(self.projected_gravity, self.cfg["noise"].get("gravity")) * self.cfg["normalization"]["gravity"],
                 apply_randomization(self.base_ang_vel, self.cfg["noise"].get("ang_vel")) * self.cfg["normalization"]["ang_vel"],
+                self.ball_pos,
+                self.ball_lin_vel,
                 #self.commands[:, :3] * commands_scale,
-                (torch.cos(2 * torch.pi * self.gait_process) * (self.gait_frequency > 1.0e-8).float()).unsqueeze(-1),
-                (torch.sin(2 * torch.pi * self.gait_process) * (self.gait_frequency > 1.0e-8).float()).unsqueeze(-1),
+                #(torch.cos(2 * torch.pi * self.gait_process) * (self.gait_frequency > 1.0e-8).float()).unsqueeze(-1),
+                #(torch.sin(2 * torch.pi * self.gait_process) * (self.gait_frequency > 1.0e-8).float()).unsqueeze(-1),
                 apply_randomization(self.dof_pos - self.default_dof_pos, self.cfg["noise"].get("dof_pos")) * self.cfg["normalization"]["dof_pos"],
                 apply_randomization(self.dof_vel, self.cfg["noise"].get("dof_vel")) * self.cfg["normalization"]["dof_vel"],
                 self.actions,
@@ -655,7 +751,7 @@ class T1_Standing(BaseTask):
 
     def _reward_root_acc(self):
         # Penalize root accelerations
-        return torch.sum(torch.square((self.last_root_vel - self.root_states[:, 7:13]) / self.dt), dim=-1)
+        return torch.sum(torch.square((self.last_root_vel - self.root_states[:, 0, 7:13]) / self.dt), dim=-1)
 
     def _reward_action_rate(self):
         # Penalize changes in actions
@@ -716,31 +812,11 @@ class T1_Standing(BaseTask):
     def _reward_feet_yaw_mean(self):
         feet_yaw_mean = self.feet_yaw.mean(dim=-1) + torch.pi * (torch.abs(self.feet_yaw[:, 1] - self.feet_yaw[:, 0]) > torch.pi)
         return torch.square((get_euler_xyz(self.base_quat)[2] - feet_yaw_mean + torch.pi) % (2 * torch.pi) - torch.pi)
-
-    def _reward_feet_distance(self):
-        _, _, base_yaw = get_euler_xyz(self.base_quat)
-        feet_distance = torch.abs(
-            torch.cos(base_yaw) * (self.feet_pos[:, 1, 1] - self.feet_pos[:, 0, 1])
-            - torch.sin(base_yaw) * (self.feet_pos[:, 1, 0] - self.feet_pos[:, 0, 0])
-        )
-        return torch.clip(self.cfg["rewards"]["feet_distance_ref"] - feet_distance, min=0.0, max=0.1)
     
-    def _reward_body_angle(self):
-        base_pitch, base_roll, base_yaw = get_euler_xyz(self.base_quat)
-        pitch_normalized = (base_pitch + torch.pi) % (2 * torch.pi) - torch.pi
-        roll_normalized = (base_roll + torch.pi) % (2 * torch.pi) - torch.pi
-        
-        # Calculate absolute distance from 0
-        pitch_distance = torch.abs(pitch_normalized)
-        roll_distance = torch.abs(roll_normalized)
-        
-        # Calculate penalty (current implementation)
-        penalty = torch.square(pitch_distance) + torch.square(roll_distance)
-        
-        # Convert to positive reward (decreasing from 1 to 0)
-        reward = 1.0 / (0.1 + penalty**2) - 1.0
-        
-        return reward
+    def _reward_ball_vel_x(self):
+        return self.ball_lin_vel[:, 0]
+    
+    
 
     #def _reward_feet_swing(self):
     #    left_swing = (torch.abs(self.gait_process - 0.25) < 0.5 * self.cfg["rewards"]["swing_period"]) & (self.gait_frequency > 1.0e-8)
