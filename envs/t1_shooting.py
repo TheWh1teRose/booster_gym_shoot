@@ -238,6 +238,7 @@ class T1_Shooting(BaseTask):
         self.privileged_obs_buf = torch.zeros(self.num_envs, self.num_privileged_obs, dtype=torch.float, device=self.device)
         self.rew_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.reset_buf = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        self.reset_ball_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device) # Buffer for ball-only resets
         self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.min_ball_vel_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         self.time_out_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
@@ -264,7 +265,7 @@ class T1_Shooting(BaseTask):
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 1]
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)  # shape: num_envs, num_bodies, xyz axis
-        self.body_states = gymtorch.wrap_tensor(body_state).view(self.num_envs, self.num_bodies, 14)
+        self.body_states = gymtorch.wrap_tensor(body_state).view(self.num_envs, self.num_bodies + 1, 13)
         # Get robot states (index 0) and ball states (index 1)
         self.base_pos = self.root_states[:, 0, 0:3]  # Robot position
         self.base_quat = self.root_states[:, 0, 3:7]  # Robot quaternion
@@ -398,20 +399,14 @@ class T1_Shooting(BaseTask):
         #    self.cfg["randomization"].get("init_base_lin_vel_xy"),
         #)
 
-        # Initialize ball states (index 1)
-        self.root_states[env_ids, 1, 0:3] = self.env_origins[env_ids, :3] + torch.tensor(self.ball_init_pos, device=self.device)
-        self.root_states[env_ids, 1, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
-        self.root_states[env_ids, 1, 7:10] = torch.zeros(3, dtype=torch.float, device=self.device)
-        self.root_states[env_ids, 1, 10:13] = torch.zeros(3, dtype=torch.float, device=self.device)
+        # Reset ball in front of the (newly reset) robot
+        self._reset_ball_at_robot_front(env_ids)
 
-        # Update the simulation with new state tensor
-        # The self.root_states tensor has been updated with the desired reset states for the specified env_ids.
-        # Now, we create a list of actor indices that correspond to these updated states.
+        # Update the simulation with new state tensor for both robot and ball
+        # The self.root_states tensor has been updated for both.
         robot_actor_indices = 2 * env_ids
         ball_actor_indices = 2 * env_ids + 1
         
-        # Interleave indices: [robot_env0, ball_env0, robot_env1, ball_env1, ...]
-        # Converts to a flat tensor of shape (2 * len(env_ids),) with dtype int32
         actor_indices_to_update = torch.stack((robot_actor_indices, ball_actor_indices), dim=-1).view(-1).to(dtype=torch.int32)
         num_indices = actor_indices_to_update.shape[0]
 
@@ -421,6 +416,53 @@ class T1_Shooting(BaseTask):
             gymtorch.unwrap_tensor(actor_indices_to_update),  # Indices of actors to update
             num_indices  # Number of actor indices
         )
+
+    def _reset_ball_at_robot_front(self, env_ids_to_reset_ball):
+        """Resets the ball in front of the robot for the specified environment IDs."""
+        if len(env_ids_to_reset_ball) == 0:
+            return
+
+        robot_pos = self.root_states[env_ids_to_reset_ball, 0, 0:3]
+        robot_quat = self.root_states[env_ids_to_reset_ball, 0, 3:7]
+
+        # Define forward vector in robot's local frame and repeat for each env
+        forward_vec_local = torch.tensor([1.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(len(env_ids_to_reset_ball), 1)
+        
+        # Rotate forward vector to world frame
+        forward_vec_world = quat_rotate(robot_quat, forward_vec_local)
+
+        # Calculate ball's target XY position
+        ball_target_xy = robot_pos[:, 0:2] + forward_vec_world[:, 0:2] * self.cfg["ball"]["init_pos"][0]
+        
+        # Calculate ball's target Z position (on the ground + ball radius)
+        if hasattr(self, 'terrain'):
+            ball_target_z = self.terrain.terrain_heights(ball_target_xy) + self.ball_radius
+        else: # Fallback if no terrain, assume ground is at z=0 relative to env_origin
+             # This assumes env_origins are at z=0 for the ground level.
+            ball_target_z = torch.full_like(ball_target_xy[:, 0], self.ball_radius)
+
+
+        # Set ball position
+        self.root_states[env_ids_to_reset_ball, 1, 0] = ball_target_xy[:, 0]
+        self.root_states[env_ids_to_reset_ball, 1, 1] = ball_target_xy[:, 1]
+        self.root_states[env_ids_to_reset_ball, 1, 2] = ball_target_z
+        
+        # Set ball orientation to default (identity quaternion)
+        identity_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device).unsqueeze(0).repeat(len(env_ids_to_reset_ball), 1)
+        self.root_states[env_ids_to_reset_ball, 1, 3:7] = identity_quat
+        
+        # Set ball linear and angular velocities to zero
+        self.root_states[env_ids_to_reset_ball, 1, 7:13] = 0.0
+
+        # Update only the ball actors in the simulation
+        ball_actor_indices = (2 * env_ids_to_reset_ball + 1).to(dtype=torch.int32)
+        if len(ball_actor_indices) > 0:
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self.root_states), # Send full buffer, but only indices for balls are used effectively for this call.
+                gymtorch.unwrap_tensor(ball_actor_indices),
+                len(ball_actor_indices)
+            )
 
     def _teleport_robot(self):
         if self.terrain.type == "plane":
@@ -574,11 +616,30 @@ class T1_Shooting(BaseTask):
 
         #self._kick_robots()
         #self._push_robots()
-        self._check_termination()
+        self._check_termination() # Sets self.reset_buf and potentially self.reset_ball_buf
+
+        # Handle ball-only resets (ball too far, but robot is not resetting)
+        ball_only_reset_env_ids = (self.reset_ball_buf & ~self.reset_buf).nonzero(as_tuple=False).flatten()
+        if len(ball_only_reset_env_ids) > 0:
+            self._reset_ball_at_robot_front(ball_only_reset_env_ids)
+            # Update convenience tensors for the reset balls as _compute_observations will use them
+            self.ball_pos[ball_only_reset_env_ids] = self.root_states[ball_only_reset_env_ids, 1, 0:3]
+            ball_quat_reset = self.root_states[ball_only_reset_env_ids, 1, 3:7]
+            self.ball_rot[ball_only_reset_env_ids] = ball_quat_reset
+            # Velocities in root_states are world, convert to local for convenience tensors
+            world_lin_vel_reset = self.root_states[ball_only_reset_env_ids, 1, 7:10]
+            world_ang_vel_reset = self.root_states[ball_only_reset_env_ids, 1, 10:13]
+            self.ball_lin_vel[ball_only_reset_env_ids] = quat_rotate_inverse(ball_quat_reset, world_lin_vel_reset)
+            self.ball_ang_vel[ball_only_reset_env_ids] = quat_rotate_inverse(ball_quat_reset, world_ang_vel_reset)
+            
+            self.reset_ball_buf[ball_only_reset_env_ids] = False
+
         self._compute_reward()
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
-        self._reset_idx(env_ids)
+        if len(env_ids) > 0:
+            self._reset_idx(env_ids) # This will call _reset_root_states, which handles ball reset too
+            self.reset_ball_buf[env_ids] = False # Ball reset is handled by full reset
         #self._teleport_robot()
 
         self._compute_observations()
@@ -651,6 +712,11 @@ class T1_Shooting(BaseTask):
         self.reset_buf |= self.time_out_buf
         self.reset_buf |= self.min_ball_vel_buf > np.ceil(self.cfg["rewards"]["min_ball_vel_s"] / self.dt)
         self.time_out_buf |= self.episode_length_buf == self.cmd_resample_time
+
+        # Check if ball is too far from robot for ball-only reset
+        dist_robot_ball = torch.norm(self.root_states[:, 0, 0:3] - self.root_states[:, 1, 0:3], dim=-1)
+        far_ball_env_ids = dist_robot_ball > self.cfg["rewards"]["terminate_ball_dist"]
+        self.reset_ball_buf[far_ball_env_ids] = True
 
     def _compute_reward(self):
         """Compute rewards
@@ -814,7 +880,49 @@ class T1_Shooting(BaseTask):
         return torch.square((get_euler_xyz(self.base_quat)[2] - feet_yaw_mean + torch.pi) % (2 * torch.pi) - torch.pi)
     
     def _reward_ball_vel_x(self):
-        return self.ball_lin_vel[:, 0]
+        # Reward for the magnitude of the ball's linear velocity in world coordinates
+        world_lin_vel = self.root_states[:, 1, 7:10]
+        return torch.clamp(torch.norm(world_lin_vel, dim=-1), max=self.cfg["rewards"]["max_ball_vel_x"])
+    
+    def _reward_left_feet_x(self):
+        # Calculate the distance between feet on the x-axis
+        _, _, base_yaw = get_euler_xyz(self.base_quat)
+        feet_x_distance =  torch.abs(
+            torch.cos(base_yaw) * (self.feet_pos[:, 1, 0] - self.feet_pos[:, 0, 0])
+            - torch.sin(base_yaw) * (self.feet_pos[:, 1, 1] - self.feet_pos[:, 0, 1])
+        )
+        
+        # Get the reference distance from config
+        target_distance = self.cfg["rewards"]["feet_distance_ref_x"]
+        
+        # Normalize the difference between actual and target distance
+        normalized_diff = -torch.abs(feet_x_distance - target_distance)
+        
+        reward = torch.exp(2.0 * (normalized_diff - 1.0) + 2)  # Exponential increase
+
+        #print(f"X-axis: feet_x_distance={feet_x_distance.mean().item():.4f}, target={target_distance:.4f}, normalized_diff={normalized_diff.mean().item():.4f}, reward={reward.mean().item():.4f}")
+        
+        return reward
+    
+    def _reward_left_feet_y(self):
+        # Calculate the distance between feet on the y-axis
+        _, _, base_yaw = get_euler_xyz(self.base_quat)
+        feet_y_distance = torch.abs(
+            torch.sin(base_yaw) * (self.feet_pos[:, 1, 1] - self.feet_pos[:, 0, 1])
+            + torch.cos(base_yaw) * (self.feet_pos[:, 1, 0] - self.feet_pos[:, 0, 0])
+        )
+        
+        # Get the reference distance from config
+        target_distance = self.cfg["rewards"]["feet_distance_ref_y"]
+        
+        # Normalize the difference between actual and target distance
+        normalized_diff = -torch.abs(feet_y_distance - target_distance)
+        
+        reward = torch.exp(2.0 * (normalized_diff - 1.0) + 2)  # Exponential increase
+        
+        #print(f"Y-axis: feet_y_distance={feet_y_distance.mean().item():.4f}, target={target_distance:.4f}, normalized_diff={normalized_diff.mean().item():.4f}, reward={reward.mean().item():.4f}")
+        
+        return reward
     
     
 
