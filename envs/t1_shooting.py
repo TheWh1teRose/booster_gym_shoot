@@ -241,6 +241,7 @@ class T1_Shooting(BaseTask):
         self.reset_ball_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device) # Buffer for ball-only resets
         self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.min_ball_vel_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.time_since_ball_is_still_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device) # New buffer
         self.time_out_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.extras = {}
         self.extras["rew_terms"] = {}
@@ -325,12 +326,16 @@ class T1_Shooting(BaseTask):
             if not found:
                 self.default_dof_pos[:, i] = self.cfg["init_state"]["default_joint_angles"]["default"]
 
+        self.last_ball_lin_vel_world = torch.zeros_like(self.root_states[:, 1, 7:10]) # World frame
+
     def _prepare_reward_function(self):
         """Prepares a list of reward functions, whcih will be called to compute the total reward.
         Looks for self._reward_<REWARD_NAME>, where <REWARD_NAME> are names of all non zero reward scales in the cfg.
         """
         # remove zero scales + multiply non-zero ones by dt
         self.reward_scales = self.cfg["rewards"]["scales"].copy()
+        self.reward_scales_ball_rolling = self.cfg["rewards"]["ball_rolling_scale"].copy()
+
         for key in list(self.reward_scales.keys()):
             scale = self.reward_scales[key]
             if scale == 0:
@@ -367,10 +372,12 @@ class T1_Shooting(BaseTask):
         self.min_ball_vel_buf[env_ids] = 0.0
         self.filtered_lin_vel[env_ids] = 0.0
         self.filtered_ang_vel[env_ids] = 0.0
+        self.time_since_ball_is_still_buf[env_ids] = 0.0 # Reset the new buffer
         self.cmd_resample_time[env_ids] = 0
 
         self.delay_steps[env_ids] = torch.randint(0, self.cfg["control"]["decimation"], (len(env_ids),), device=self.device)
         self.extras["time_outs"] = self.time_out_buf
+        self.last_ball_lin_vel_world[env_ids] = 0.0 # Reset for selected envs
 
     def _reset_dofs(self, env_ids):
         self.dof_pos[env_ids] = apply_randomization(self.default_dof_pos, self.cfg["randomization"].get("init_dof_pos"))
@@ -426,13 +433,17 @@ class T1_Shooting(BaseTask):
         robot_quat = self.root_states[env_ids_to_reset_ball, 0, 3:7]
 
         # Define forward vector in robot's local frame and repeat for each env
-        forward_vec_local = torch.tensor([1.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(len(env_ids_to_reset_ball), 1)
+        forward_vec_local = torch.tensor([1.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(len(env_ids_to_reset_ball), 1)
         
         # Rotate forward vector to world frame
         forward_vec_world = quat_rotate(robot_quat, forward_vec_local)
 
+        ball_init_pos = torch.zeros_like(forward_vec_world)
+        ball_init_pos[:, 0] = apply_randomization(ball_init_pos[:, 0], self.cfg["randomization"].get("ball_init_pos_x"))
+        ball_init_pos[:, 1] = apply_randomization(ball_init_pos[:, 1], self.cfg["randomization"].get("ball_init_pos_y"))
+
         # Calculate ball's target XY position
-        ball_target_xy = robot_pos[:, 0:2] + forward_vec_world[:, 0:2] * self.cfg["ball"]["init_pos"][0]
+        ball_target_xy = robot_pos[:, 0:2] + forward_vec_world[:, 0:2] * ball_init_pos[:, 0:2]
         
         # Calculate ball's target Z position (on the ground + ball radius)
         if hasattr(self, 'terrain'):
@@ -582,6 +593,9 @@ class T1_Shooting(BaseTask):
         self.torques /= self.cfg["control"]["decimation"]
         self.render()
 
+        # Store previous ball velocity in world frame *before* refreshing root states for current step
+        prev_ball_lin_vel_world = self.root_states[:, 1, 7:10].clone()
+
         # post physics step
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
@@ -614,6 +628,13 @@ class T1_Shooting(BaseTask):
         self.common_step_counter += 1
         self.gait_process[:] = torch.fmod(self.gait_process + self.dt * self.gait_frequency, 1.0)
 
+        # Update time_since_ball_is_still_buf
+        ball_speed_threshold = self.cfg["rewards"].get("ball_active_speed_threshold", 0.1) # Configurable threshold
+        ball_is_active = torch.norm(self.root_states[:, 1, 7:10], dim=-1) > ball_speed_threshold
+        self.time_since_ball_is_still_buf = torch.where(ball_is_active, 
+                                                        torch.zeros_like(self.time_since_ball_is_still_buf), 
+                                                        self.time_since_ball_is_still_buf + self.dt)
+
         #self._kick_robots()
         #self._push_robots()
         self._check_termination() # Sets self.reset_buf and potentially self.reset_ball_buf
@@ -636,10 +657,19 @@ class T1_Shooting(BaseTask):
 
         self._compute_reward()
 
+        # Update last_ball_lin_vel_world *before* potential full reset for next step's calculation
+        # For envs that were not reset (neither full nor ball-only), this is their current velocity.
+        # For envs that *were* reset (either full or ball-only), their velocity was set to 0.0 during reset,
+        # so this correctly reflects their "last" velocity as 0 before the next step.
+        self.last_ball_lin_vel_world[:] = self.root_states[:, 1, 7:10]
+
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         if len(env_ids) > 0:
             self._reset_idx(env_ids) # This will call _reset_root_states, which handles ball reset too
             self.reset_ball_buf[env_ids] = False # Ball reset is handled by full reset
+            # For fully reset environments, ensure their last_ball_lin_vel_world is also 0 for next step
+            self.last_ball_lin_vel_world[env_ids] = 0.0
+
         #self._teleport_robot()
 
         self._compute_observations()
@@ -713,22 +743,52 @@ class T1_Shooting(BaseTask):
         self.reset_buf |= self.min_ball_vel_buf > np.ceil(self.cfg["rewards"]["min_ball_vel_s"] / self.dt)
         self.time_out_buf |= self.episode_length_buf == self.cmd_resample_time
 
-        # Check if ball is too far from robot for ball-only reset
+        # Add termination if ball is still for too long
+        max_ball_still_time = self.cfg["rewards"].get("max_ball_still_time_s", 4.0) # Configurable duration
+        self.reset_buf |= self.time_since_ball_is_still_buf > max_ball_still_time
+
+        # Check if ball is too far from robot for reset
         dist_robot_ball = torch.norm(self.root_states[:, 0, 0:3] - self.root_states[:, 1, 0:3], dim=-1)
         far_ball_env_ids = dist_robot_ball > self.cfg["rewards"]["terminate_ball_dist"]
-        self.reset_ball_buf[far_ball_env_ids] = True
+        self.reset_buf[far_ball_env_ids] |= True
 
     def _compute_reward(self):
         """Compute rewards
         Calls each reward function which had a non-zero scale (processed in self._prepare_reward_function())
         adds each terms to the episode sums and to the total reward
         """
+
+        ball_is_moving = torch.norm(self.ball_lin_vel, dim=-1) >= 0.1  # True if ball is "still"
+
         self.rew_buf[:] = 0.0
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
-            rew = self.reward_functions[i]() * self.reward_scales[name]
+            raw_reward_values = self.reward_functions[i]() # Shape: (num_envs)
+
+            normal_scale = self.reward_scales[name] # Scalar, default scale for this reward
+
+            # Initialize effective_scales with normal_scale. This applies if:
+            # 1. No specific ball_rolling_scale is defined for this reward.
+            # 2. A specific ball_rolling_scale is defined, but the ball is NOT moving.
+            effective_scales_for_envs = torch.full_like(raw_reward_values, normal_scale)
+
+            # Check if a specific scale for "ball moving" scenarios exists for this reward name
+            ball_moving_specific_scale = self.reward_scales_ball_rolling.get(name) # Scalar or None
+
+            if ball_moving_specific_scale is not None:
+                # A specific scale for a moving ball exists for this reward.
+                # We apply this scale IF the ball is moving.
+                # If the ball is not moving, effective_scales_for_envs (which is normal_scale) is used.
+                effective_scales_for_envs = torch.where(ball_is_moving,
+                                                        torch.full_like(raw_reward_values, ball_moving_specific_scale),
+                                                        effective_scales_for_envs)
+            
+            # At this point, effective_scales_for_envs contains the correct scale for each environment
+            # based on whether the ball is moving and whether a specific scale for moving ball exists.
+
+            rew = raw_reward_values * effective_scales_for_envs
             self.rew_buf += rew
-            self.extras["rew_terms"][name] = rew
+            self.extras["rew_terms"][name] = rew # Store the final scaled reward
         if self.cfg["rewards"]["only_positive_rewards"]:
             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.0)
 
@@ -738,12 +798,22 @@ class T1_Shooting(BaseTask):
         #    [self.cfg["normalization"]["lin_vel"], self.cfg["normalization"]["lin_vel"], self.cfg["normalization"]["ang_vel"]],
         #    device=self.device,
         #)
+        
+        # Calculate ball position relative to the robot
+        ball_pos_world_frame = self.ball_pos - self.base_pos
+        relative_ball_pos = quat_rotate_inverse(self.base_quat, ball_pos_world_frame)
+        
+        # calculate ball velocity relative to the robot
+        ball_vel_world_frame = self.ball_lin_vel
+        relative_ball_vel = quat_rotate_inverse(self.base_quat, ball_vel_world_frame)
+        
         self.obs_buf = torch.cat(
             (
                 apply_randomization(self.projected_gravity, self.cfg["noise"].get("gravity")) * self.cfg["normalization"]["gravity"],
                 apply_randomization(self.base_ang_vel, self.cfg["noise"].get("ang_vel")) * self.cfg["normalization"]["ang_vel"],
-                self.ball_pos,
-                self.ball_lin_vel,
+                # Use relative ball position in observations
+                relative_ball_pos[:, 0:2],
+                #relative_ball_vel[:, 0:2],
                 #self.commands[:, :3] * commands_scale,
                 #(torch.cos(2 * torch.pi * self.gait_process) * (self.gait_frequency > 1.0e-8).float()).unsqueeze(-1),
                 #(torch.sin(2 * torch.pi * self.gait_process) * (self.gait_frequency > 1.0e-8).float()).unsqueeze(-1),
@@ -758,6 +828,7 @@ class T1_Shooting(BaseTask):
                 self.base_mass_scaled,
                 apply_randomization(self.base_lin_vel, self.cfg["noise"].get("lin_vel")) * self.cfg["normalization"]["lin_vel"],
                 apply_randomization(self.base_pos[:, 2] - self.terrain.terrain_heights(self.base_pos), self.cfg["noise"].get("height")).unsqueeze(-1),
+                relative_ball_vel[:, 0:2],
                 self.pushing_forces[:, 0, :] * self.cfg["normalization"]["push_force"],
                 self.pushing_torques[:, 0, :] * self.cfg["normalization"]["push_torque"],
             ),
@@ -878,11 +949,7 @@ class T1_Shooting(BaseTask):
     def _reward_feet_yaw_mean(self):
         feet_yaw_mean = self.feet_yaw.mean(dim=-1) + torch.pi * (torch.abs(self.feet_yaw[:, 1] - self.feet_yaw[:, 0]) > torch.pi)
         return torch.square((get_euler_xyz(self.base_quat)[2] - feet_yaw_mean + torch.pi) % (2 * torch.pi) - torch.pi)
-    
-    def _reward_ball_vel_x(self):
-        # Reward for the magnitude of the ball's linear velocity in world coordinates
-        world_lin_vel = self.root_states[:, 1, 7:10]
-        return torch.clamp(torch.norm(world_lin_vel, dim=-1), max=self.cfg["rewards"]["max_ball_vel_x"])
+
     
     def _reward_left_feet_x(self):
         # Calculate the distance between feet on the x-axis
@@ -924,9 +991,100 @@ class T1_Shooting(BaseTask):
         
         return reward
     
-    
+    def _reward_ball_velocity_target_direction(self):
+        """Rewards kicking the ball towards a target position in the world frame."""
+        # cfg["rewards"]["ball_target_position"] - e.g. [5.0, 0.0, 0.0] (target position in world space)
+        # cfg["rewards"]["max_ball_vel_target_reward"] - max reward for this component
+        # cfg["rewards"]["ball_vel_target_direction_sigma"] - for scaling the reward
+        
+        # Get the target position from config
+        target_position = to_torch(self.cfg["rewards"].get("ball_target_position", [5.0, 0.0, self.ball_radius]), device=self.device).unsqueeze(0)
+        
+        # Get current ball position and velocity (in world frame)
+        ball_pos_world = self.body_states[:, -1, 0:3]
+        ball_vel_world = self.body_states[:, -1, 7:10]
+        
+        # Calculate the direction vector from ball to target
+        ball_to_target = target_position - ball_pos_world
+        distance_to_target = torch.norm(ball_to_target, dim=-1, keepdim=True)
+        
+        # Normalize the direction vector (avoid division by zero)
+        ball_to_target_normalized = ball_to_target / (distance_to_target + 1e-6)
+        
+        # Project ball velocity onto the target direction
+        velocity_towards_target = torch.sum(ball_vel_world * ball_to_target_normalized, dim=-1)
+        
+        # Reward only positive velocity towards the target
+        # Using an exponential function for a smoother reward landscape
+        sigma = self.cfg["rewards"].get("ball_vel_target_direction_sigma", 1.0)
+        reward = torch.exp(velocity_towards_target / sigma)
+        
+        # Clamp the reward to avoid excessively large values
+        max_reward = self.cfg["rewards"].get("max_ball_vel_target_reward", 5.0)
+        
+        return torch.clamp(reward, min=0.0, max=max_reward)
 
-    #def _reward_feet_swing(self):
-    #    left_swing = (torch.abs(self.gait_process - 0.25) < 0.5 * self.cfg["rewards"]["swing_period"]) & (self.gait_frequency > 1.0e-8)
-    #    right_swing = (torch.abs(self.gait_process - 0.75) < 0.5 * self.cfg["rewards"]["swing_period"]) & (self.gait_frequency > 1.0e-8)
-    #    return (left_swing & ~self.feet_contact[:, 0]).float() + (right_swing & ~self.feet_contact[:, 1]).float()
+    def _reward_kicking_foot_approach_ball_stationary(self):
+        """Rewards moving the kicking foot towards the ball, only if the ball is stationary."""
+        # cfg["rewards"]["kicking_foot_index"] - e.g., 0 or 1
+        # cfg["rewards"]["ball_stationary_speed_threshold"] - Max speed for ball to be "stationary"
+        # cfg["rewards"]["approach_proximity_sigma"] - For exp decay of distance reward
+        # cfg["rewards"]["max_approach_reward"]
+
+        kicking_foot_idx = self.cfg["rewards"].get("kicking_foot_index", 0)
+        if kicking_foot_idx >= len(self.feet_indices):
+            # print(f"Warning: kicking_foot_idx {kicking_foot_idx} is out of range for feet_indices. Defaulting to 0.")
+            kicking_foot_idx = 0
+
+        current_ball_pos_world = self.root_states[:, 1, 0:3]
+        current_ball_vel_world = self.root_states[:, 1, 7:10]
+        ball_speed_world = torch.norm(current_ball_vel_world, dim=-1)
+
+        stationary_threshold = self.cfg["rewards"].get("ball_stationary_speed_threshold", 0.05)
+        ball_is_stationary = ball_speed_world < stationary_threshold
+
+        kicking_foot_pos_world = self.feet_pos[:, kicking_foot_idx, :]
+        foot_ball_dist = torch.norm(kicking_foot_pos_world - current_ball_pos_world, dim=-1)
+
+        proximity_sigma = self.cfg["rewards"].get("approach_proximity_sigma", 0.1)
+        # Reward is higher when foot is closer
+        proximity_value = torch.exp(-foot_ball_dist / proximity_sigma) 
+
+        # Only give reward if the ball is stationary
+        reward = ball_is_stationary.float() * proximity_value
+        
+        max_reward = self.cfg["rewards"].get("max_approach_reward", 2.0)
+        return torch.clamp(reward, min=0.0, max=max_reward)
+
+    def _reward_body_alignment_for_kick(self):
+        """Rewards aligning the robot's body towards the ball and a target."""
+        # cfg["rewards"]["kick_target_pos_world"] - e.g., [5.0, 0.0, 0.0] (a point in world space)
+        # cfg["rewards"]["alignment_to_ball_sigma"]
+        # cfg["rewards"]["alignment_to_target_sigma"]
+        # cfg["rewards"]["max_alignment_reward"]
+
+        robot_pos_world = self.base_pos
+        robot_quat_world = self.base_quat
+        ball_pos_world = self.root_states[:, 1, 0:3]
+        
+        # Robot's forward vector in world frame
+        # Assuming robot's local forward is X-axis: [1,0,0]
+        robot_forward_local = torch.tensor([1.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        robot_forward_world = quat_rotate(robot_quat_world, robot_forward_local)
+        
+        # Vector from robot to ball
+        robot_to_ball_world = ball_pos_world - robot_pos_world
+        robot_to_ball_world_normalized = robot_to_ball_world / (torch.norm(robot_to_ball_world, dim=-1, keepdim=True) + 1e-6)
+
+        # Alignment with a fixed target position
+        kick_target_pos_world = to_torch(self.cfg["rewards"].get("kick_target_pos_world", [5.0, 0.0, self.ball_radius]), device=self.device).unsqueeze(0)
+        robot_to_target_world = kick_target_pos_world - robot_pos_world
+        robot_to_target_world_normalized = robot_to_target_world / (torch.norm(robot_to_target_world, dim=-1, keepdim=True) + 1e-6)
+        
+        alignment_to_target = torch.sum(robot_forward_world * robot_to_target_world_normalized, dim=-1)
+        sigma_target = self.cfg["rewards"].get("alignment_to_target_sigma", 0.5)
+        reward_align_target = torch.exp((alignment_to_target - 1.0) / sigma_target)
+
+
+        max_reward = self.cfg["rewards"].get("max_alignment_reward", 1.0)
+        return torch.clamp(reward_align_target, min=0.0, max=max_reward)
