@@ -278,10 +278,10 @@ randomization:
 rewards:
   scales:
     survival: 2
-    tracking_lin_vel_x: 0.01
-    tracking_lin_vel_y: 0.01
+    tracking_lin_vel_x: 0.5
+    tracking_lin_vel_y: 0.5
     base_height: -100.
-    orientation: -0.1
+    orientation: -1
     torques: -2.e-4
     torque_tiredness: -1.e-2
     power: -2.e-3
@@ -299,20 +299,13 @@ rewards:
     feet_vel_z: -0.
     feet_yaw_diff: -1.
     feet_yaw_mean: -1.
-    feet_roll: -0.15
+    feet_roll: -0.3
     left_feet_x: 0
     left_feet_y: 0
     ball_velocity_target_direction: 4
     kicking_foot_approach_ball_stationary: 20
     body_alignment_for_kick: 10
   ball_rolling_scale:
-    tracking_lin_vel_x: 0.05
-    tracking_lin_vel_y: 0.05
-    orientation: -0.5
-    ang_vel_xy: -0.015
-    root_acc: -1.e-5
-    left_feet_x: 0.3
-    left_feet_y: 1
     kicking_foot_approach_ball_stationary: 0.0
     
 
