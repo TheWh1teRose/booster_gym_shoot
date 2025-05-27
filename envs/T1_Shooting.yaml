@@ -277,17 +277,17 @@ randomization:
 
 rewards:
   scales:
-    survival: 0.35
+    survival: 2
     tracking_lin_vel_x: 0.01
     tracking_lin_vel_y: 0.01
-    base_height: -20.
+    base_height: -100.
     orientation: -0.1
     torques: -2.e-4
     torque_tiredness: -1.e-2
     power: -2.e-3
-    lin_vel_z: -2.
-    ang_vel_xy: -0.01
-    dof_vel: -1.e-4
+    lin_vel_z: -1.5
+    ang_vel_xy: -0.008
+    dof_vel: -3.e-4
     dof_acc: -1.e-7
     root_acc: -1.e-7
     action_rate: -0.5
@@ -299,18 +299,18 @@ rewards:
     feet_vel_z: -0.
     feet_yaw_diff: -1.
     feet_yaw_mean: -1.
-    feet_roll: -0.1
+    feet_roll: -0.15
     left_feet_x: 0
     left_feet_y: 0
-    ball_velocity_target_direction: 10
+    ball_velocity_target_direction: 4
     kicking_foot_approach_ball_stationary: 20
     body_alignment_for_kick: 10
   ball_rolling_scale:
     tracking_lin_vel_x: 0.05
     tracking_lin_vel_y: 0.05
     orientation: -0.5
-    ang_vel_xy: -0.02
-    root_acc: -1.e-6
+    ang_vel_xy: -0.015
+    root_acc: -1.e-5
     left_feet_x: 0.3
     left_feet_y: 1
     kicking_foot_approach_ball_stationary: 0.0
@@ -332,7 +332,6 @@ rewards:
   feet_distance_ref_y: 0
   min_ball_vel_s: 2
   max_ball_vel_x: 3
-  terminate_ball_dist: 4.0
   
   # Parameters for new kick-related rewards
   ball_target_position: [5.0, 0.0, 0.05] # Target position for ball to move toward (world frame, z should be ball radius)
@@ -345,7 +344,7 @@ rewards:
   # max_kick_timing_reward: 2.0          # Max reward for foot_ball_proximity_and_kick_timing
 
   # Parameters for _reward_kicking_foot_approach_ball_stationary
-  ball_stationary_speed_threshold: 0.05 # Max ball speed (m/s) to be considered stationary
+  ball_stationary_speed_threshold: 0.1 # Max ball speed (m/s) to be considered stationary
   approach_proximity_sigma: 0.1        # Sigma for proximity reward in kicking_foot_approach_ball_stationary
   max_approach_reward: 2.0             # Max reward for kicking_foot_approach_ball_stationary
 
@@ -360,5 +359,7 @@ rewards:
   min_steps_travel_after_kick: 10              # Min sim steps ball must travel after kick before rest check applies
 
   # Parameters for "ball is still for too long" reset condition
-  max_ball_still_time_s: 2.0
-  
+  max_ball_still_time_s: 2
+
+  # Parameters for "ball is moving for too long" reset condition
+  max_ball_moving_time_s: 3

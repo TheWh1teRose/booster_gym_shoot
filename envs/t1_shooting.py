@@ -241,7 +241,8 @@ class T1_Shooting(BaseTask):
         self.reset_ball_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device) # Buffer for ball-only resets
         self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.min_ball_vel_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
-        self.time_since_ball_is_still_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device) # New buffer
+        self.time_since_ball_is_still_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.time_since_ball_is_moving_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.time_out_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.extras = {}
         self.extras["rew_terms"] = {}
@@ -372,7 +373,8 @@ class T1_Shooting(BaseTask):
         self.min_ball_vel_buf[env_ids] = 0.0
         self.filtered_lin_vel[env_ids] = 0.0
         self.filtered_ang_vel[env_ids] = 0.0
-        self.time_since_ball_is_still_buf[env_ids] = 0.0 # Reset the new buffer
+        self.time_since_ball_is_still_buf[env_ids] = 0.0
+        self.time_since_ball_is_moving_buf[env_ids] = 0.0
         self.cmd_resample_time[env_ids] = 0
 
         self.delay_steps[env_ids] = torch.randint(0, self.cfg["control"]["decimation"], (len(env_ids),), device=self.device)
@@ -629,11 +631,14 @@ class T1_Shooting(BaseTask):
         self.gait_process[:] = torch.fmod(self.gait_process + self.dt * self.gait_frequency, 1.0)
 
         # Update time_since_ball_is_still_buf
-        ball_speed_threshold = self.cfg["rewards"].get("ball_active_speed_threshold", 0.1) # Configurable threshold
+        ball_speed_threshold = self.cfg["rewards"].get("ball_stationary_speed_threshold", 0.1) # Configurable threshold
         ball_is_active = torch.norm(self.root_states[:, 1, 7:10], dim=-1) > ball_speed_threshold
         self.time_since_ball_is_still_buf = torch.where(ball_is_active, 
                                                         torch.zeros_like(self.time_since_ball_is_still_buf), 
                                                         self.time_since_ball_is_still_buf + self.dt)
+        self.time_since_ball_is_moving_buf = torch.where(~ball_is_active, 
+                                                        torch.zeros_like(self.time_since_ball_is_moving_buf), 
+                                                        self.time_since_ball_is_moving_buf + self.dt)
 
         #self._kick_robots()
         #self._push_robots()
@@ -747,10 +752,9 @@ class T1_Shooting(BaseTask):
         max_ball_still_time = self.cfg["rewards"].get("max_ball_still_time_s", 4.0) # Configurable duration
         self.reset_buf |= self.time_since_ball_is_still_buf > max_ball_still_time
 
-        # Check if ball is too far from robot for reset
-        dist_robot_ball = torch.norm(self.root_states[:, 0, 0:3] - self.root_states[:, 1, 0:3], dim=-1)
-        far_ball_env_ids = dist_robot_ball > self.cfg["rewards"]["terminate_ball_dist"]
-        self.reset_buf[far_ball_env_ids] |= True
+        # Add termination if ball is moving for too long
+        max_ball_moving_time = self.cfg["rewards"].get("max_ball_moving_time_s", 4.0) # Configurable duration
+        self.reset_buf |= self.time_since_ball_is_moving_buf > max_ball_moving_time
 
     def _compute_reward(self):
         """Compute rewards
