@@ -1,4 +1,5 @@
 import os
+import csv
 
 from isaacgym import gymtorch, gymapi
 from isaacgym.torch_utils import (
@@ -29,6 +30,7 @@ class T1_Shooting(BaseTask):
         self.gym.prepare_sim(self.sim)
         self._init_buffers()
         self._prepare_reward_function()
+        self._init_csv_logging()
 
     def _create_envs(self):
         self.num_envs = self.cfg["env"]["num_envs"]
@@ -273,8 +275,8 @@ class T1_Shooting(BaseTask):
         self.base_quat = self.root_states[:, 0, 3:7]  # Robot quaternion
         self.ball_pos = self.root_states[:, 1, 0:3]  # Ball position
         self.ball_rot = self.root_states[:, 1, 3:7]  # Ball quaternion
-        self.ball_lin_vel = self.root_states[:, 1, 7:10]  # Ball linear velocity
-        self.ball_ang_vel = self.root_states[:, 1, 10:13]  # Ball angular velocity
+        self.ball_lin_vel = self.body_states[:, -1, 7:10]  # Ball linear velocity
+        self.ball_ang_vel = self.body_states[:, -1, 10:13]  # Ball angular velocity
         self.feet_pos = self.body_states[:, self.feet_indices, 0:3]
         self.feet_quat = self.body_states[:, self.feet_indices, 3:7]
 
@@ -327,7 +329,7 @@ class T1_Shooting(BaseTask):
             if not found:
                 self.default_dof_pos[:, i] = self.cfg["init_state"]["default_joint_angles"]["default"]
 
-        self.last_ball_lin_vel_world = torch.zeros_like(self.root_states[:, 1, 7:10]) # World frame
+        self.last_ball_lin_vel_world = torch.zeros_like(self.body_states[:, -1, 7:10]) # World frame
 
     def _prepare_reward_function(self):
         """Prepares a list of reward functions, whcih will be called to compute the total reward.
@@ -343,6 +345,11 @@ class T1_Shooting(BaseTask):
                 self.reward_scales.pop(key)
             else:
                 self.reward_scales[key] *= self.dt
+
+        for key in list(self.reward_scales_ball_rolling.keys()):
+            scale = self.reward_scales_ball_rolling[key]
+            self.reward_scales_ball_rolling[key] *= self.dt
+
         # prepare list of functions
         self.reward_functions = []
         self.reward_names = []
@@ -350,6 +357,91 @@ class T1_Shooting(BaseTask):
             self.reward_names.append(name)
             name = "_reward_" + name
             self.reward_functions.append(getattr(self, name))
+
+    def _init_csv_logging(self):
+        """Initialize CSV logging for reward values"""
+        # Check if CSV logging is enabled in config
+        self.csv_logging_enabled = self.cfg.get("basic", {}).get("enable_csv_logging", True)
+        
+        if not self.csv_logging_enabled:
+            print("CSV logging disabled in configuration")
+            return
+            
+        # Only log for environment 0 (single environment setup)
+        self.log_env_id = 0
+        
+        # Create logs directory if it doesn't exist
+        self.log_dir = "logs"
+        if not os.path.exists(self.log_dir):
+            os.makedirs(self.log_dir)
+        
+        # Create CSV file with timestamp
+        import time
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.csv_filename = os.path.join(self.log_dir, f"debug_csv/reward_log_{timestamp}.csv")
+        
+        # Prepare CSV headers
+        self.csv_headers = [
+            "episode_step", "total_reward",
+            "ball_pos_x", "ball_pos_y", "ball_pos_z",
+            "ball_vel_x", "ball_vel_y", "ball_vel_z",
+            "robot_pos_x", "robot_pos_y", "robot_pos_z",
+            "robot_lin_vel_x", "robot_lin_vel_y", "robot_lin_vel_z",
+            "ball_speed", "ball_distance_to_robot"
+        ]
+        reward_names = ["reward_" + name for name in self.reward_names]
+        self.csv_headers.extend(reward_names)  # Add all individual reward terms
+        
+        # Initialize CSV file with headers
+        with open(self.csv_filename, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(self.csv_headers)
+        
+        print(f"CSV logging initialized: {self.csv_filename}")
+
+    def _log_rewards_to_csv(self):
+        """Log current step rewards to CSV file"""
+        # Check if CSV logging is enabled
+        if not getattr(self, 'csv_logging_enabled', False):
+            return
+            
+        # Only log for the specified environment (0)
+        if hasattr(self, 'episode_length_buf'):
+            episode_step = self.episode_length_buf[self.log_env_id].item()
+            total_reward = self.rew_buf[self.log_env_id].item()
+            
+            # Get ball and robot state information
+            ball_pos = self.ball_pos[self.log_env_id].cpu().numpy()
+            ball_vel_world = self.root_states[self.log_env_id, 1, 7:10].cpu().numpy()
+            robot_pos = self.base_pos[self.log_env_id].cpu().numpy()
+            robot_lin_vel = self.base_lin_vel[self.log_env_id].cpu().numpy()
+            
+            # Calculate derived metrics
+            ball_speed = torch.norm(self.root_states[self.log_env_id, 1, 7:10]).item()
+            ball_distance_to_robot = torch.norm(self.ball_pos[self.log_env_id] - self.base_pos[self.log_env_id]).item()
+            
+            # Prepare row data
+            row_data = [
+                episode_step, total_reward,
+                ball_pos[0], ball_pos[1], ball_pos[2],
+                ball_vel_world[0], ball_vel_world[1], ball_vel_world[2],
+                robot_pos[0], robot_pos[1], robot_pos[2],
+                robot_lin_vel[0], robot_lin_vel[1], robot_lin_vel[2],
+                ball_speed, ball_distance_to_robot
+            ]
+            
+            # Add individual reward terms
+            for reward_name in self.reward_names:
+                if reward_name in self.extras["rew_terms"]:
+                    reward_value = self.extras["rew_terms"][reward_name][self.log_env_id].item()
+                    row_data.append(reward_value)
+                else:
+                    row_data.append(0.0)  # Default if reward term not found
+            
+            # Write to CSV
+            with open(self.csv_filename, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(row_data)
 
     def reset(self):
         """Reset all robots"""
@@ -604,9 +696,8 @@ class T1_Shooting(BaseTask):
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         
         self.ball_pos[:] = self.root_states[:, 1, 0:3]
-        ball_quat = self.root_states[:, 1, 3:7]
-        self.ball_lin_vel[:] = quat_rotate_inverse(ball_quat, self.root_states[:, 1, 7:10])
-        self.ball_ang_vel[:] = quat_rotate_inverse(ball_quat, self.root_states[:, 1, 10:13])
+        self.ball_lin_vel[:] = self.body_states[:, -1, 7:10]
+        self.ball_ang_vel[:] = self.body_states[:, -1, 10:13]
 
         self.base_pos[:] = self.root_states[:, 0, 0:3]
         self.base_quat[:] = self.root_states[:, 0, 3:7]
@@ -662,11 +753,14 @@ class T1_Shooting(BaseTask):
 
         self._compute_reward()
 
+        # Log rewards to CSV file
+        self._log_rewards_to_csv()
+
         # Update last_ball_lin_vel_world *before* potential full reset for next step's calculation
         # For envs that were not reset (neither full nor ball-only), this is their current velocity.
         # For envs that *were* reset (either full or ball-only), their velocity was set to 0.0 during reset,
         # so this correctly reflects their "last" velocity as 0 before the next step.
-        self.last_ball_lin_vel_world[:] = self.root_states[:, 1, 7:10]
+        self.last_ball_lin_vel_world[:] = self.body_states[:, -1, 7:10]
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         if len(env_ids) > 0:
@@ -786,9 +880,6 @@ class T1_Shooting(BaseTask):
                 effective_scales_for_envs = torch.where(ball_is_moving,
                                                         torch.full_like(raw_reward_values, ball_moving_specific_scale),
                                                         effective_scales_for_envs)
-            
-            # At this point, effective_scales_for_envs contains the correct scale for each environment
-            # based on whether the ball is moving and whether a specific scale for moving ball exists.
 
             rew = raw_reward_values * effective_scales_for_envs
             self.rew_buf += rew
@@ -806,11 +897,7 @@ class T1_Shooting(BaseTask):
         # Calculate ball position relative to the robot
         ball_pos_world_frame = self.ball_pos - self.base_pos
         relative_ball_pos = quat_rotate_inverse(self.base_quat, ball_pos_world_frame)
-        
-        # calculate ball velocity relative to the robot
-        ball_vel_world_frame = self.ball_lin_vel
-        relative_ball_vel = quat_rotate_inverse(self.base_quat, ball_vel_world_frame)
-        
+
         self.obs_buf = torch.cat(
             (
                 apply_randomization(self.projected_gravity, self.cfg["noise"].get("gravity")) * self.cfg["normalization"]["gravity"],
@@ -832,7 +919,9 @@ class T1_Shooting(BaseTask):
                 self.base_mass_scaled,
                 apply_randomization(self.base_lin_vel, self.cfg["noise"].get("lin_vel")) * self.cfg["normalization"]["lin_vel"],
                 apply_randomization(self.base_pos[:, 2] - self.terrain.terrain_heights(self.base_pos), self.cfg["noise"].get("height")).unsqueeze(-1),
-                relative_ball_vel[:, 0:2],
+                self.ball_lin_vel[:, 0:2],
+                self.feet_pos[:, 0, 0:2],
+                self.feet_pos[:, 1, 0:2],
                 self.pushing_forces[:, 0, :] * self.cfg["normalization"]["push_force"],
                 self.pushing_torques[:, 0, :] * self.cfg["normalization"]["push_torque"],
             ),
@@ -1000,9 +1089,10 @@ class T1_Shooting(BaseTask):
         # cfg["rewards"]["ball_target_position"] - e.g. [5.0, 0.0, 0.0] (target position in world space)
         # cfg["rewards"]["max_ball_vel_target_reward"] - max reward for this component
         # cfg["rewards"]["ball_vel_target_direction_sigma"] - for scaling the reward
+        # cfg["rewards"]["ball_velocity_decay_time"] - time constant for exponential decay when ball is moving
         
         # Get the target position from config
-        target_position = to_torch(self.cfg["rewards"].get("ball_target_position", [5.0, 0.0, self.ball_radius]), device=self.device).unsqueeze(0)
+        target_position = to_torch([5.0, 0.0, 0.05], device=self.device).unsqueeze(0)
         
         # Get current ball position and velocity (in world frame)
         ball_pos_world = self.body_states[:, -1, 0:3]
@@ -1021,42 +1111,42 @@ class T1_Shooting(BaseTask):
         # Reward only positive velocity towards the target
         # Using an exponential function for a smoother reward landscape
         sigma = self.cfg["rewards"].get("ball_vel_target_direction_sigma", 1.0)
-        reward = torch.exp(velocity_towards_target / sigma)
+        base_reward = velocity_towards_target
+        
+        # Add decay factor based on how long the ball has been moving
+        decay_time_constant = self.cfg["rewards"].get("ball_velocity_decay_time", 2.0)  # Time constant in seconds
+        decay_factor = torch.exp(-self.time_since_ball_is_moving_buf / decay_time_constant)
+        
+        # Apply decay to the reward
+        reward = base_reward * decay_factor
         
         # Clamp the reward to avoid excessively large values
         max_reward = self.cfg["rewards"].get("max_ball_vel_target_reward", 5.0)
         
-        return torch.clamp(reward, min=0.0, max=max_reward)
+        return reward
 
     def _reward_kicking_foot_approach_ball_stationary(self):
         """Rewards moving the kicking foot towards the ball, only if the ball is stationary."""
-        # cfg["rewards"]["kicking_foot_index"] - e.g., 0 or 1
         # cfg["rewards"]["ball_stationary_speed_threshold"] - Max speed for ball to be "stationary"
         # cfg["rewards"]["approach_proximity_sigma"] - For exp decay of distance reward
         # cfg["rewards"]["max_approach_reward"]
+        # cfg["rewards"]["foot_velocity_towards_ball_scale"] - Scale for velocity reward
+        # cfg["rewards"]["foot_velocity_weight"] - Weight for velocity vs proximity reward (0-1)
 
-        kicking_foot_idx = self.cfg["rewards"].get("kicking_foot_index", 0)
-        if kicking_foot_idx >= len(self.feet_indices):
-            # print(f"Warning: kicking_foot_idx {kicking_foot_idx} is out of range for feet_indices. Defaulting to 0.")
-            kicking_foot_idx = 0
+        current_ball_pos_world = self.body_states[:, -1, 0:3]
 
-        current_ball_pos_world = self.root_states[:, 1, 0:3]
-        current_ball_vel_world = self.root_states[:, 1, 7:10]
-        ball_speed_world = torch.norm(current_ball_vel_world, dim=-1)
+        foot_ball_dist_left = torch.norm(self.feet_pos[:, 0, :] - current_ball_pos_world, dim=-1)
+        foot_ball_dist_right = torch.norm(self.feet_pos[:, 1, :] - current_ball_pos_world, dim=-1)
 
-        stationary_threshold = self.cfg["rewards"].get("ball_stationary_speed_threshold", 0.05)
-        ball_is_stationary = ball_speed_world < stationary_threshold
+        foot_ball_dist = torch.min(foot_ball_dist_left, foot_ball_dist_right)
 
-        kicking_foot_pos_world = self.feet_pos[:, kicking_foot_idx, :]
-        foot_ball_dist = torch.norm(kicking_foot_pos_world - current_ball_pos_world, dim=-1)
-
+        # Proximity reward (existing)
         proximity_sigma = self.cfg["rewards"].get("approach_proximity_sigma", 0.1)
-        # Reward is higher when foot is closer
         proximity_value = torch.exp(-foot_ball_dist / proximity_sigma) 
-
-        # Only give reward if the ball is stationary
-        reward = ball_is_stationary.float() * proximity_value
         
+        # Only give reward if the ball is stationary
+        reward = proximity_value
+
         max_reward = self.cfg["rewards"].get("max_approach_reward", 2.0)
         return torch.clamp(reward, min=0.0, max=max_reward)
 
@@ -1092,3 +1182,41 @@ class T1_Shooting(BaseTask):
 
         max_reward = self.cfg["rewards"].get("max_alignment_reward", 1.0)
         return torch.clamp(reward_align_target, min=0.0, max=max_reward)
+    
+    def _reward_body_angle(self):
+        base_pitch, base_roll, base_yaw = get_euler_xyz(self.base_quat)
+        pitch_normalized = (base_pitch + torch.pi) % (2 * torch.pi) - torch.pi
+        roll_normalized = (base_roll + torch.pi) % (2 * torch.pi) - torch.pi
+        
+        # Calculate absolute distance from 0
+        pitch_distance = torch.abs(pitch_normalized)
+        roll_distance = torch.abs(roll_normalized)
+        
+        # Calculate penalty (current implementation)
+        penalty = torch.square(pitch_distance) + torch.square(roll_distance)
+        
+        # Convert to positive reward (decreasing from 1 to 0)
+        reward = 1.0 / (0.1 + penalty**2) - 1.0
+        
+        return reward
+
+    def _reward_ball_acceleration(self):
+        """Rewards ball acceleration towards the target direction, encouraging effective kicks."""
+        # Get current and previous ball velocities in world frame
+        current_ball_vel_world = self.body_states[:, -1, 7:9]
+        prev_ball_vel_world = self.last_ball_lin_vel_world[:,:2]
+        
+        # Calculate ball acceleration (change in velocity / time)
+        ball_acceleration = (current_ball_vel_world - prev_ball_vel_world) / self.dt
+
+        ball_effective_acceleration = ball_acceleration[:, 0] - torch.abs(ball_acceleration[:, 1])
+        
+        # Get parameters from config with defaults
+        acceleration_scale = self.cfg["rewards"].get("ball_acceleration_scale", 10.0)
+        max_acceleration_reward = self.cfg["rewards"].get("max_ball_acceleration_reward", 1.0)
+        
+        # Only reward positive acceleration towards target
+        # Using tanh for smooth, bounded rewardball_effective_acceleration
+        reward = torch.tanh(torch.clamp(ball_effective_acceleration, min=0.0) / acceleration_scale) * max_acceleration_reward
+        
+        return reward
