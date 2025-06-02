@@ -1123,7 +1123,7 @@ class T1_Shooting(BaseTask):
         # Clamp the reward to avoid excessively large values
         max_reward = self.cfg["rewards"].get("max_ball_vel_target_reward", 5.0)
         
-        return reward
+        return torch.clamp(reward, min=0.0, max=max_reward)
 
     def _reward_kicking_foot_approach_ball_stationary(self):
         """Rewards moving the kicking foot towards the ball, only if the ball is stationary."""
