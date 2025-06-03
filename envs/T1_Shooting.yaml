@@ -1,6 +1,6 @@
 basic:
   checkpoint: null # set to -1 to load last saved model
-  headless: true
+  headless: false
   max_iterations: 10000 # set the maximum number of learning iterations to train for
   sim_device: "cuda:0" # device for physics simulation
   rl_device: "cuda:0" # device for the RL algorithm
@@ -10,7 +10,7 @@ basic:
   enable_csv_logging: false
 
 env:    
-  num_envs: 2048
+  num_envs: 1
   num_observations: 44
   num_privileged_obs: 20
   num_actions: 12
@@ -162,6 +162,7 @@ normalization:
   push_force: 0.1
   push_torque: 0.5
   clip_actions: 1.
+  ball_pos: 1.0
 
 noise:
   gravity:
@@ -188,6 +189,10 @@ noise:
     range: [0., 0.02]
     operation: "additive"
     distribution: "gaussian"
+  ball_pos:
+    range: [-0.01, 0.01]
+    operation: "additive"
+    distribution: "gaussian"
 
 randomization:
   init_dof_pos:
@@ -200,6 +205,10 @@ randomization:
     distribution: "uniform"
   init_base_lin_vel_xy:
     range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+  init_base_ang:
+    range: [-0.1, 0.1]
     operation: "additive"
     distribution: "gaussian"
 

@@ -312,8 +312,8 @@ class T1_Shooting(BaseTask):
         self.mean_ang_vel_level = 0.0
         self.max_lin_vel_level = 0.0
         self.max_ang_vel_level = 0.0
-        self.pushing_forces = torch.zeros(self.num_envs, self.num_bodies, 3, dtype=torch.float, device=self.device)
-        self.pushing_torques = torch.zeros(self.num_envs, self.num_bodies, 3, dtype=torch.float, device=self.device)
+        self.pushing_forces = torch.zeros(self.num_envs, self.num_bodies + 1, 3, dtype=torch.float, device=self.device)
+        self.pushing_torques = torch.zeros(self.num_envs, self.num_bodies + 1, 3, dtype=torch.float, device=self.device)
         self.feet_roll = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device)
         self.feet_yaw = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device)
         self.last_feet_pos = torch.zeros_like(self.feet_pos)
@@ -489,16 +489,18 @@ class T1_Shooting(BaseTask):
         self.root_states[env_ids, 0, :2] += self.env_origins[env_ids, :2]
         #self.root_states[env_ids, 0, :2] = apply_randomization(self.root_states[env_ids, 0, :2], self.cfg["randomization"].get("init_base_pos_xy"))
         #self.root_states[env_ids, 0, 2] += self.terrain.terrain_heights(self.root_states[env_ids, 0, :2])
-        #self.root_states[env_ids, 0, 3:7] = quat_from_euler_xyz(
-        #    torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
-        #    torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
-        #    torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
-        #    #torch.rand(len(env_ids), device=self.device) * (2 * torch.pi),
-        #)
-        #self.root_states[env_ids, 0, 7:9] = apply_randomization(
-        #    torch.zeros(len(env_ids), 2, dtype=torch.float, device=self.device),
-        #    self.cfg["randomization"].get("init_base_lin_vel_xy"),
-        #)
+        self.root_states[env_ids, 0, 3:7] = quat_from_euler_xyz(
+            torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
+            torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
+            apply_randomization(
+                torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
+                self.cfg["randomization"].get("init_base_ang")
+                ),
+        )
+        self.root_states[env_ids, 0, 7:9] = apply_randomization(
+            torch.zeros(len(env_ids), 2, dtype=torch.float, device=self.device),
+            self.cfg["randomization"].get("init_base_lin_vel_xy"),
+        )
 
         # Reset ball in front of the (newly reset) robot
         self._reset_ball_at_robot_front(env_ids)
@@ -731,8 +733,8 @@ class T1_Shooting(BaseTask):
                                                         torch.zeros_like(self.time_since_ball_is_moving_buf), 
                                                         self.time_since_ball_is_moving_buf + self.dt)
 
-        #self._kick_robots()
-        #self._push_robots()
+        self._kick_robots()
+        self._push_robots()
         self._check_termination() # Sets self.reset_buf and potentially self.reset_ball_buf
 
         # Handle ball-only resets (ball too far, but robot is not resetting)
@@ -903,7 +905,7 @@ class T1_Shooting(BaseTask):
                 apply_randomization(self.projected_gravity, self.cfg["noise"].get("gravity")) * self.cfg["normalization"]["gravity"],
                 apply_randomization(self.base_ang_vel, self.cfg["noise"].get("ang_vel")) * self.cfg["normalization"]["ang_vel"],
                 # Use relative ball position in observations
-                relative_ball_pos[:, 0:2],
+                apply_randomization(relative_ball_pos[:, 0:2], self.cfg["noise"].get("ball_pos")) * self.cfg["normalization"]["ball_pos"],  
                 #relative_ball_vel[:, 0:2],
                 #self.commands[:, :3] * commands_scale,
                 #(torch.cos(2 * torch.pi * self.gait_process) * (self.gait_frequency > 1.0e-8).float()).unsqueeze(-1),
