@@ -1222,3 +1222,13 @@ class T1_Shooting(BaseTask):
         reward = torch.tanh(torch.clamp(ball_effective_acceleration, min=0.0) / acceleration_scale) * max_acceleration_reward
         
         return reward
+
+    def _reward_waiting(self):
+        """Reward that increases quadratically with time elapsed in the episode."""
+        # Get current progress through episode (0 to 1)
+        progress = self.episode_length_buf / np.ceil(self.cfg["rewards"]["max_ball_still_time_s"] / self.dt)
+        
+        # Quadratic reward from 0 to 1 based on progress
+        reward = progress * progress
+        
+        return reward
